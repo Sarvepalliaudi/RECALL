@@ -53,7 +53,7 @@ async def index_client_item(
     dev_res = await db.execute(
         select(Device).where(Device.id == item.device_id, Device.user_id == current_user.id)
     )
-    device = dev_res.scalar_one_or_none()
+    device = dev_res.scalars().first()
     if not device:
         device = Device(
             id=item.device_id,
@@ -75,7 +75,7 @@ async def index_client_item(
             IndexedFile.relative_path == item.relative_path,
         )
     )
-    db_file = existing.scalar_one_or_none()
+    db_file = existing.scalars().first()
 
     mod_dt = None
     if item.file_modified_at:
@@ -188,7 +188,7 @@ async def upload_and_index_file(
             IndexedFile.content_hash == content_hash,
         )
     )
-    db_existing = existing.scalar_one_or_none()
+    db_existing = existing.scalars().first()
     if db_existing:
         return {"message": f"File '{file.filename}' unchanged. Index up to date.", "file_id": db_existing.id, "chunks_indexed": 0}
 
@@ -266,3 +266,137 @@ async def delete_indexed_file(
     await db.commit()
 
     return {"message": f"Index representation for '{file_obj.filename}' removed successfully."}
+
+
+@router.post("/seed-samples")
+async def seed_sample_memories(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Populates realistic multi-device demo memories matching the product specification:
+    - Windows PC: AWS_Cloud_Architecture.md, Disaster_Recovery_Team_Chart.md, GATE_CS_Algorithms_Preparation.md
+    - MacBook Pro: Quantum_Computing_Overview.md
+    - iPhone: Mobile_Cloud_Invoice_Receipt.txt
+    """
+    from pathlib import Path
+    samples_dir = Path(__file__).resolve().parent.parent.parent.parent / "samples"
+    
+    device_configs = [
+        {"id": "win-workstation-demo", "name": "Windows PC", "platform": "windows"},
+        {"id": "macbook-demo", "name": "MacBook Pro", "platform": "macos"},
+        {"id": "iphone-demo", "name": "iPhone 15 Pro", "platform": "ios"},
+    ]
+
+    devices_map = {}
+    for d in device_configs:
+        dev_res = await db.execute(select(Device).where(Device.id == d["id"], Device.user_id == current_user.id))
+        dev = dev_res.scalar_one_or_none()
+        if not dev:
+            dev = Device(
+                id=d["id"],
+                user_id=current_user.id,
+                name=d["name"],
+                platform=d["platform"],
+                client_type="pwa",
+                sync_enabled=True,
+                last_seen_at=datetime.now(timezone.utc),
+            )
+            db.add(dev)
+        devices_map[d["id"]] = dev
+
+    await db.flush()
+
+    sample_files_data = [
+        {
+            "device_id": "win-workstation-demo",
+            "filename": "AWS_Cloud_Architecture.md",
+            "relative_path": "Downloads/AWS_Cloud_Architecture.md",
+            "sample_name": "AWS_Cloud_Architecture.md",
+            "sync_status": "full_synced",
+        },
+        {
+            "device_id": "win-workstation-demo",
+            "filename": "Disaster_Recovery_Team_Chart.md",
+            "relative_path": "Documents/Work/Disaster_Recovery_Team_Chart.md",
+            "sample_name": "Disaster_Recovery_Team_Chart.md",
+            "sync_status": "full_synced",
+        },
+        {
+            "device_id": "win-workstation-demo",
+            "filename": "GATE_CS_Algorithms_Preparation.md",
+            "relative_path": "Downloads/GATE_Prep/GATE_CS_Algorithms_Preparation.md",
+            "sample_name": "GATE_CS_Algorithms_Preparation.md",
+            "sync_status": "index_synced",
+        },
+        {
+            "device_id": "macbook-demo",
+            "filename": "Quantum_Computing_Overview.md",
+            "relative_path": "Research/Quantum_Computing_Overview.md",
+            "sample_name": "Quantum_Computing_Overview.md",
+            "sync_status": "index_synced",
+        },
+        {
+            "device_id": "iphone-demo",
+            "filename": "Mobile_Cloud_Invoice_Receipt.txt",
+            "relative_path": "Camera/Scans/Mobile_Cloud_Invoice_Receipt.txt",
+            "sample_name": "Mobile_Cloud_Invoice_Receipt.txt",
+            "sync_status": "full_synced",
+        },
+    ]
+
+    indexed_count = 0
+    for s in sample_files_data:
+        file_path = samples_dir / s["sample_name"]
+        if not file_path.exists():
+            continue
+
+        raw_bytes = file_path.read_bytes()
+        extracted = extract_content_from_file(s["filename"], raw_bytes)
+        
+        # Check if already seeded
+        existing = await db.execute(
+            select(IndexedFile).where(
+                IndexedFile.user_id == current_user.id,
+                IndexedFile.filename == s["filename"]
+            )
+        )
+        db_file = existing.scalar_one_or_none()
+        if not db_file:
+            db_file = IndexedFile(
+                user_id=current_user.id,
+                device_id=s["device_id"],
+                filename=s["filename"],
+                relative_path=s["relative_path"],
+                extension=extracted["extension"],
+                size_bytes=len(raw_bytes),
+                content_hash=extracted["content_hash"],
+                sync_status=s["sync_status"],
+                file_modified_at=datetime.now(timezone.utc),
+            )
+            db.add(db_file)
+            await db.flush()
+
+            # Chunks & Embeddings
+            text_chunks = chunk_text(extracted["text"])
+            chunk_texts = [c["content"] for c in text_chunks]
+            if chunk_texts:
+                vectors = await asyncio.to_thread(generate_embeddings_batch, chunk_texts)
+                for c, vec in zip(text_chunks, vectors):
+                    chunk_obj = DocumentChunk(
+                        file_id=db_file.id,
+                        user_id=current_user.id,
+                        device_id=s["device_id"],
+                        chunk_index=c["chunk_index"],
+                        content=c["content"],
+                        token_count=c["token_count"],
+                        embedding_json=json.dumps(vec),
+                    )
+                    db.add(chunk_obj)
+            indexed_count += 1
+
+    await db.commit()
+    return {
+        "message": f"Successfully loaded {indexed_count} realistic sample memories across Windows, MacBook, and iPhone!",
+        "samples_loaded": indexed_count
+    }

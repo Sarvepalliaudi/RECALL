@@ -1,0 +1,19 @@
+=============================================================
+RECEIPT / INVOICE: AWS Cloud & Infrastructure Monthly Hosting
+Device: iPhone 15 Pro (Camera / Mobile Scans)
+Date: 2026-09-15
+Invoice ID: INV-984210-AWS
+=============================================================
+Bill to: Audi Siva Bhanuvardhan Sarvepalli
+Account ID: 9482-1029-4412
+Description                                   Amount (USD)
+-------------------------------------------------------------
+Amazon EC2 Elastic Compute Cluster (c6i.xlarge)     $142.50
+Amazon RDS Multi-AZ PostgreSQL (db.m6g.large)       $189.20
+Amazon Route 53 DNS Queries & Health Probes          $12.30
+AWS Data Transfer Out (Inter-region peering)         $24.80
+AWS CloudWatch Logs & Alarms Monitoring              $18.50
+-------------------------------------------------------------
+TOTAL AMOUNT PAID:                                  $387.30
+Status: PAID IN FULL (Visa ending in 4102)
+=============================================================
