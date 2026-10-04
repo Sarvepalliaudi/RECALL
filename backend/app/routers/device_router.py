@@ -2,6 +2,7 @@
 Device Management Router for RECALL.
 Handles device registration, status tracking, sync opt-in toggles, and device unlinking.
 """
+import uuid
 from datetime import datetime, timezone
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -93,6 +94,7 @@ async def register_device(
         device.is_active = True
     else:
         device = Device(
+            id=req.device_id if req.device_id else str(uuid.uuid4()),
             user_id=current_user.id,
             name=req.name,
             platform=req.platform,

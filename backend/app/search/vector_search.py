@@ -36,14 +36,14 @@ async def execute_search(
     # 2. Vector Embedding of the Semantic Topic
     query_vector = generate_embedding(parsed.semantic_topic)
 
-    # 3. Vector Database Retrieval
+    # 3. Vector Database Retrieval (Ranker applies soft type boost)
     candidates = await vector_store.search_similar_chunks(
         session=session,
         user_id=user_id,
         query_vector=query_vector,
-        top_k=limit * 2,
+        top_k=limit * 3,
         device_ids=device_filter,
-        file_types=parsed.target_extensions if parsed.target_extensions else None,
+        file_types=None,
     )
 
     # 4. Multi-Factor Ranking & Relevance Labeling

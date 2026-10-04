@@ -129,11 +129,15 @@ def rank_results(
         # Composite multi-factor score
         composite_score = (
             0.50 * v_sim +
-            0.20 * kw_score +
+            0.25 * kw_score +
             0.15 * type_bonus +
-            0.10 * date_score +
-            0.05 * device_bonus
+            0.08 * date_score +
+            0.02 * device_bonus
         )
+
+        # Keyword overlap boost for direct mentions
+        if kw_score >= 0.2:
+            composite_score = min(1.0, composite_score + 0.20)
 
         cand["composite_score"] = composite_score
 
@@ -148,11 +152,11 @@ def rank_results(
         score = item["composite_score"]
         
         # Categorize into human-understandable relevance tiers
-        if score >= 0.75:
+        if score >= 0.65:
             tier = RelevanceTier.VERY_RELEVANT
-        elif score >= 0.55:
+        elif score >= 0.40:
             tier = RelevanceTier.RELEVANT
-        elif score >= 0.35:
+        elif score >= 0.18:
             tier = RelevanceTier.POSSIBLE_MATCH
         else:
             continue  # Exclude irrelevant noise

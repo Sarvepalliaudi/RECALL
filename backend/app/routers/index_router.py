@@ -49,13 +49,22 @@ async def index_client_item(
     Indexes a file representation sent by the client.
     Generates embeddings for chunks and persists them in the user's vector store.
     """
-    # Verify device exists and belongs to user
     dev_res = await db.execute(
         select(Device).where(Device.id == item.device_id, Device.user_id == current_user.id)
     )
     device = dev_res.scalar_one_or_none()
     if not device:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target device not found.")
+        device = Device(
+            id=item.device_id,
+            user_id=current_user.id,
+            name="Current Client Device",
+            platform="desktop",
+            client_type="pwa",
+            sync_enabled=True,
+            last_seen_at=datetime.now(timezone.utc),
+        )
+        db.add(device)
+        await db.flush()
 
     # Check if this exact file version already exists
     existing = await db.execute(
@@ -152,7 +161,17 @@ async def upload_and_index_file(
     )
     device = dev_res.scalar_one_or_none()
     if not device:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target device not found.")
+        device = Device(
+            id=device_id,
+            user_id=current_user.id,
+            name="Current Client Device",
+            platform="desktop",
+            client_type="pwa",
+            sync_enabled=True,
+            last_seen_at=datetime.now(timezone.utc),
+        )
+        db.add(device)
+        await db.flush()
 
     data = await file.read()
     extracted = extract_content_from_file(file.filename, data)
