@@ -71,5 +71,50 @@ def generate_embedding(text: str) -> List[float]:
 
 
 def generate_embeddings_batch(texts: List[str]) -> List[List[float]]:
-    """Generate vector embeddings for a list of text strings."""
-    return [generate_embedding(t) for t in texts]
+    """Generate vector embeddings for a list of text strings in a single batch request."""
+    if not texts:
+        return []
+
+    results: List[Optional[List[float]]] = [None] * len(texts)
+    uncached_indices: List[int] = []
+    uncached_texts: List[str] = []
+
+    for i, t in enumerate(texts):
+        cleaned = t.strip()
+        if not cleaned:
+            results[i] = [0.0] * 768
+            continue
+        h = hashlib.sha256(cleaned.encode("utf-8")).hexdigest()
+        if h in _EMBEDDING_CACHE:
+            results[i] = _EMBEDDING_CACHE[h]
+        else:
+            uncached_indices.append(i)
+            uncached_texts.append(cleaned)
+
+    if not uncached_texts:
+        return [r for r in results if r is not None]
+
+    client = _get_genai_client()
+    if client and uncached_texts:
+        try:
+            # Batch call to Google GenAI SDK
+            response = client.models.embed_content(
+                model=settings.GEMINI_EMBEDDING_MODEL,
+                contents=uncached_texts,
+            )
+            if hasattr(response, "embeddings") and response.embeddings:
+                for idx, emb_obj in zip(uncached_indices, response.embeddings):
+                    v = list(emb_obj.values)
+                    h = hashlib.sha256(texts[idx].strip().encode("utf-8")).hexdigest()
+                    _EMBEDDING_CACHE[h] = v
+                    results[idx] = v
+                return [r if r is not None else [0.0] * 768 for r in results]
+        except Exception as e:
+            print(f"[Warning] Batch embedding failed ({e}). Falling back to individual generation.")
+
+    # Fallback for any remaining uncached chunks
+    for idx in uncached_indices:
+        if results[idx] is None:
+            results[idx] = generate_embedding(texts[idx])
+
+    return [r if r is not None else [0.0] * 768 for r in results]

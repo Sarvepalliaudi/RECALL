@@ -16,6 +16,8 @@ const IGNORED_FOLDERS = new Set([
   "build", ".vscode", ".idea", "AppData", "System Volume Information", "$RECYCLE.BIN"
 ]);
 
+const PARALLEL_WORKERS = 4;
+
 export default function HomePage() {
   const [query, setQuery] = useState("");
   const [searching, setSearching] = useState(false);
@@ -35,10 +37,16 @@ export default function HomePage() {
   const [indexedFiles, setIndexedFiles] = useState<any[]>([]);
   const [showIndexedList, setShowIndexedList] = useState(false);
   const [loadingFiles, setLoadingFiles] = useState(false);
+  const [isDragging, setIsDragging] = useState(false);
 
   const searchInputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const cancelIndexRef = useRef(false);
+  const indexedFilesRef = useRef<any[]>([]);
+
+  useEffect(() => {
+    indexedFilesRef.current = indexedFiles;
+  }, [indexedFiles]);
 
   // Load device info & existing indexed files
   useEffect(() => {
@@ -69,7 +77,7 @@ export default function HomePage() {
           sync_enabled: true,
         });
       } catch (e) {
-        console.warn("Auto-register error (using local guest session):", e);
+        console.warn("Auto-register notice:", e);
       }
 
       refreshFilesList();
@@ -91,6 +99,7 @@ export default function HomePage() {
     try {
       const files = await api.listIndexedFiles();
       setIndexedFiles(files || []);
+      indexedFilesRef.current = files || [];
     } catch (err) {
       console.warn("Could not list indexed files:", err);
     } finally {
@@ -121,6 +130,65 @@ export default function HomePage() {
     }
   };
 
+  // High-performance parallel upload pipeline
+  const processFilesInParallel = async (
+    items: { file: File; path: string }[],
+    concurrency = PARALLEL_WORKERS
+  ) => {
+    if (items.length === 0) return { completed: 0, skipped: 0, errors: 0 };
+
+    let completed = 0;
+    let skipped = 0;
+    let errors = 0;
+    let queueIdx = 0;
+
+    async function worker() {
+      while (queueIdx < items.length && !cancelIndexRef.current) {
+        const idx = queueIdx++;
+        const item = items[idx];
+
+        // 1. Instant Client-Side Duplicate Skip (0ms)
+        const alreadyIndexed = indexedFilesRef.current.some(
+          (f) => f.filename === item.file.name && f.size_bytes === item.file.size
+        );
+        if (alreadyIndexed) {
+          skipped++;
+          completed++;
+          setIndexProgressPct(Math.round((completed / items.length) * 100));
+          continue;
+        }
+
+        setIndexStatus(
+          `[${completed + 1}/${items.length}] Processing: ${item.file.name} (${Math.min(concurrency, items.length)} parallel pipelines)`
+        );
+
+        try {
+          await api.uploadFile(deviceId, item.file);
+          completed++;
+          await saveLocalFileRecord({
+            id: crypto.randomUUID(),
+            filename: item.file.name,
+            relativePath: item.path,
+            extension: item.file.name.substring(item.file.name.lastIndexOf(".")),
+            sizeBytes: item.file.size,
+            lastModified: item.file.lastModified,
+            indexedAt: Date.now(),
+            syncStatus: "index_synced",
+          });
+        } catch (err: any) {
+          console.error(`Error uploading ${item.file.name}:`, err);
+          errors++;
+        }
+
+        setIndexProgressPct(Math.round((completed / items.length) * 100));
+      }
+    }
+
+    const workerCount = Math.min(concurrency, items.length);
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    return { completed, skipped, errors };
+  };
+
   // Chromium Native Directory Picker (File System Access API)
   const handlePickDirectoryNative = async () => {
     if (!fsSupported) return;
@@ -143,10 +211,13 @@ export default function HomePage() {
           if (entry.kind === "file") {
             const ext = entry.name.substring(entry.name.lastIndexOf(".")).toLowerCase();
             if (SUPPORTED_EXTS.has(ext)) {
-              const file = await entry.getFile();
-              // Skip files larger than 25MB to keep indexing fast and responsive
-              if (file.size <= 25 * 1024 * 1024) {
-                filesToProcess.push({ file, path: entryPath });
+              try {
+                const file = await entry.getFile();
+                if (file.size <= 25 * 1024 * 1024) {
+                  filesToProcess.push({ file, path: entryPath });
+                }
+              } catch (e) {
+                // Permission or read error
               }
             }
           } else if (entry.kind === "directory") {
@@ -166,42 +237,14 @@ export default function HomePage() {
         return;
       }
 
-      setIndexStatus(`Found ${filesToProcess.length} supported files. Starting indexing pipeline...`);
+      setIndexStatus(`Discovered ${filesToProcess.length} supported files. Launching parallel indexing...`);
 
-      let completed = 0;
-      let errors = 0;
-
-      for (let i = 0; i < filesToProcess.length; i++) {
-        if (cancelIndexRef.current) {
-          setIndexStatus(`Indexing paused by user. Processed ${completed} files.`);
-          break;
-        }
-
-        const item = filesToProcess[i];
-        setIndexStatus(`[${i + 1}/${filesToProcess.length}] Indexing: ${item.file.name}`);
-        setIndexProgressPct(Math.round(((i + 1) / filesToProcess.length) * 100));
-
-        try {
-          await api.uploadFile(deviceId, item.file);
-          completed++;
-          await saveLocalFileRecord({
-            id: crypto.randomUUID(),
-            filename: item.file.name,
-            relativePath: item.path,
-            extension: item.file.name.substring(item.file.name.lastIndexOf(".")),
-            sizeBytes: item.file.size,
-            lastModified: item.file.lastModified,
-            indexedAt: Date.now(),
-            syncStatus: "index_synced",
-          });
-        } catch (err: any) {
-          console.error(`Error indexing ${item.file.name}:`, err);
-          errors++;
-        }
-      }
+      const { completed, skipped, errors } = await processFilesInParallel(filesToProcess);
 
       if (!cancelIndexRef.current) {
-        setIndexStatus(`Successfully indexed ${completed} files into memory (${errors} skipped).`);
+        setIndexStatus(
+          `Indexing finished! ${completed - skipped} new files indexed, ${skipped} unchanged files skipped (${errors} errors).`
+        );
         setIndexProgressPct(100);
         setTimeout(() => {
           setIndexStatus(null);
@@ -221,7 +264,7 @@ export default function HomePage() {
     }
   };
 
-  // Cross-Platform Fallback: HTML5 File / Directory input
+  // HTML5 Directory & File Input
   const handleHtml5FileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const rawFiles = e.target.files;
     if (!rawFiles || rawFiles.length === 0) return;
@@ -230,13 +273,12 @@ export default function HomePage() {
     cancelIndexRef.current = false;
     setIndexProgressPct(0);
 
-    // Filter supported files
-    const validFiles: File[] = [];
+    const validFiles: { file: File; path: string }[] = [];
     for (let i = 0; i < rawFiles.length; i++) {
       const f = rawFiles[i];
       const ext = f.name.substring(f.name.lastIndexOf(".")).toLowerCase();
       if (SUPPORTED_EXTS.has(ext) && f.size <= 25 * 1024 * 1024) {
-        validFiles.push(f);
+        validFiles.push({ file: f, path: f.webkitRelativePath || f.name });
       }
     }
 
@@ -247,37 +289,13 @@ export default function HomePage() {
       return;
     }
 
-    setIndexStatus(`Discovered ${validFiles.length} supported files. Processing...`);
+    setIndexStatus(`Discovered ${validFiles.length} supported files. Processing in parallel...`);
 
-    let count = 0;
-    let errors = 0;
+    const { completed, skipped, errors } = await processFilesInParallel(validFiles);
 
-    for (let i = 0; i < validFiles.length; i++) {
-      if (cancelIndexRef.current) break;
-      const file = validFiles[i];
-      setIndexStatus(`[${i + 1}/${validFiles.length}] Indexing: ${file.name}`);
-      setIndexProgressPct(Math.round(((i + 1) / validFiles.length) * 100));
-
-      try {
-        await api.uploadFile(deviceId, file);
-        count++;
-        await saveLocalFileRecord({
-          id: crypto.randomUUID(),
-          filename: file.name,
-          relativePath: file.webkitRelativePath || file.name,
-          extension: file.name.substring(file.name.lastIndexOf(".")),
-          sizeBytes: file.size,
-          lastModified: file.lastModified,
-          indexedAt: Date.now(),
-          syncStatus: "index_synced",
-        });
-      } catch (err: any) {
-        console.error(`Error uploading ${file.name}:`, err);
-        errors++;
-      }
-    }
-
-    setIndexStatus(`Successfully indexed ${count} files (${errors} skipped).`);
+    setIndexStatus(
+      `Indexing complete! ${completed - skipped} new files added, ${skipped} unchanged skipped (${errors} errors).`
+    );
     setIndexProgressPct(100);
     setTimeout(() => {
       setIndexStatus(null);
@@ -289,9 +307,91 @@ export default function HomePage() {
     await refreshFilesList();
   };
 
+  // Drag and Drop Handling (Folders & Files)
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(true);
+  };
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+  };
+
+  const handleDrop = async (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+    const items = e.dataTransfer.items;
+    if (!items || items.length === 0) return;
+
+    setIndexing(true);
+    cancelIndexRef.current = false;
+    setIndexStatus("Reading dropped files and directories...");
+    setIndexProgressPct(0);
+
+    const droppedFiles: { file: File; path: string }[] = [];
+
+    // Helper to traverse file system entries from DataTransfer
+    async function traverseEntry(entry: any, currentPath = "") {
+      if (!entry) return;
+      if (entry.isFile) {
+        const file: File = await new Promise((resolve) => entry.file(resolve));
+        const ext = file.name.substring(file.name.lastIndexOf(".")).toLowerCase();
+        if (SUPPORTED_EXTS.has(ext) && file.size <= 25 * 1024 * 1024) {
+          droppedFiles.push({ file, path: currentPath ? `${currentPath}/${file.name}` : file.name });
+        }
+      } else if (entry.isDirectory) {
+        if (!IGNORED_FOLDERS.has(entry.name)) {
+          const reader = entry.createReader();
+          const entries: any[] = await new Promise((resolve) => reader.readEntries(resolve));
+          for (const sub of entries) {
+            await traverseEntry(sub, currentPath ? `${currentPath}/${entry.name}` : entry.name);
+          }
+        }
+      }
+    }
+
+    for (let i = 0; i < items.length; i++) {
+      const entry = items[i].webkitGetAsEntry?.();
+      if (entry) {
+        await traverseEntry(entry);
+      } else {
+        const f = items[i].getAsFile();
+        if (f) {
+          const ext = f.name.substring(f.name.lastIndexOf(".")).toLowerCase();
+          if (SUPPORTED_EXTS.has(ext) && f.size <= 25 * 1024 * 1024) {
+            droppedFiles.push({ file: f, path: f.name });
+          }
+        }
+      }
+    }
+
+    if (droppedFiles.length === 0) {
+      setIndexStatus("No supported documents found in dropped items.");
+      setIndexing(false);
+      setIndexProgressPct(null);
+      return;
+    }
+
+    setIndexStatus(`Discovered ${droppedFiles.length} files. Starting parallel index...`);
+    const { completed, skipped, errors } = await processFilesInParallel(droppedFiles);
+
+    setIndexStatus(
+      `Drop indexing complete! ${completed - skipped} new files added, ${skipped} unchanged skipped.`
+    );
+    setIndexProgressPct(100);
+    setTimeout(() => {
+      setIndexStatus(null);
+      setIndexProgressPct(null);
+    }, 5000);
+
+    setIndexing(false);
+    await refreshFilesList();
+  };
+
   const handleCancelIndexing = () => {
     cancelIndexRef.current = true;
-    setIndexStatus("Cancelling indexing...");
+    setIndexStatus("Halting indexing worker pool...");
   };
 
   const handleDeleteFile = async (fileId: string, filename: string) => {
@@ -301,8 +401,8 @@ export default function HomePage() {
     try {
       await api.deleteIndexedFile(fileId);
       await refreshFilesList();
-      if (searchResults.some(r => r.file_id === fileId)) {
-        setSearchResults(searchResults.filter(r => r.file_id !== fileId));
+      if (searchResults.some((r) => r.file_id === fileId)) {
+        setSearchResults(searchResults.filter((r) => r.file_id !== fileId));
       }
     } catch (err: any) {
       alert(`Could not delete index: ${err.message}`);
@@ -310,7 +410,14 @@ export default function HomePage() {
   };
 
   return (
-    <div className="max-w-5xl mx-auto w-full px-4 py-6 sm:px-6 flex-1 flex flex-col font-sans">
+    <div
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+      className={`max-w-5xl mx-auto w-full px-4 py-6 sm:px-6 flex-1 flex flex-col font-sans transition-colors ${
+        isDragging ? "bg-surface-raised border-2 border-dashed border-accent-blue" : ""
+      }`}
+    >
       {/* Top Device & Memory Summary Bar */}
       <div className="border border-border bg-surface p-4 mb-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4 font-mono text-xs">
         <div>
@@ -331,13 +438,13 @@ export default function HomePage() {
             <button
               onClick={handlePickDirectoryNative}
               disabled={indexing}
-              className="px-3 py-2 bg-foreground text-background font-bold hover:bg-muted disabled:opacity-50"
+              className="px-3.5 py-2 bg-foreground text-background font-bold hover:bg-muted disabled:opacity-50 text-xs font-mono"
             >
               {indexing ? "Indexing..." : "[ + Index Folder ]"}
             </button>
           )}
 
-          <label className="px-3 py-2 border border-border bg-surface-raised hover:border-muted text-foreground cursor-pointer">
+          <label className="px-3.5 py-2 border border-border bg-surface-raised hover:border-muted text-foreground cursor-pointer text-xs font-mono">
             <span>[ + Select Files / Folder ]</span>
             <input
               ref={fileInputRef}
@@ -352,12 +459,19 @@ export default function HomePage() {
 
           <button
             onClick={() => setShowIndexedList(!showIndexedList)}
-            className="px-3 py-2 border border-border bg-surface-raised hover:border-muted text-muted hover:text-foreground"
+            className="px-3 py-2 border border-border bg-surface-raised hover:border-muted text-muted hover:text-foreground text-xs font-mono"
           >
             {showIndexedList ? "[ Hide Files List ]" : `[ View Memory Files (${indexedFiles.length}) ]`}
           </button>
         </div>
       </div>
+
+      {/* Drag & Drop Feedback Banner */}
+      {isDragging && (
+        <div className="border border-accent-blue bg-blue-950/50 p-6 mb-4 text-center font-mono text-sm text-foreground animate-pulse">
+          Drop folders or files here to immediately index into RECALL memory...
+        </div>
+      )}
 
       {/* Indexing Progress & Feedback Bar */}
       {indexStatus && (
@@ -508,7 +622,7 @@ export default function HomePage() {
           <span>
             <strong className="text-foreground">No files in memory yet.</strong> RECALL searches meaning across files you select.
           </span>
-          <span className="text-accent-blue">Click [+ Index Folder] above to start.</span>
+          <span className="text-accent-blue">Click [+ Index Folder] or drop files here to start.</span>
         </div>
       )}
 
@@ -605,7 +719,7 @@ export default function HomePage() {
           <div className="border border-border bg-surface p-12 text-center font-mono text-xs text-muted space-y-4">
             <div className="text-foreground font-bold text-base">“Your devices remember files. RECALL remembers meaning.”</div>
             <p className="max-w-lg mx-auto font-sans leading-relaxed">
-              Query your personal documents, notes, diagrams, and code using natural language. To get started, click <strong className="text-foreground font-mono">[ + Index Folder ]</strong> above to grant browser access to a local folder, or search files already synchronized across your devices.
+              Query your personal documents, notes, diagrams, and code using natural language. To get started, click <strong className="text-foreground font-mono">[ + Index Folder ]</strong> above, or drag and drop files and folders right onto this page.
             </p>
           </div>
         ) : null}

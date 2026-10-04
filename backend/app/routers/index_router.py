@@ -2,6 +2,7 @@
 File Indexing and Content Synchronization Router for RECALL.
 Processes incoming files, text extractions, chunking, and embedding generation.
 """
+import asyncio
 import json
 from datetime import datetime, timezone
 from typing import List, Optional
@@ -16,7 +17,7 @@ from app.security.auth import get_current_user
 from app.indexer.extractors import extract_content_from_file, compute_sha256
 from app.indexer.chunker import chunk_text
 from app.indexer.ocr import extract_ocr_from_image
-from app.indexer.embeddings import generate_embedding
+from app.indexer.embeddings import generate_embedding, generate_embeddings_batch
 
 router = APIRouter(prefix="/index", tags=["Indexing & Extraction"])
 
@@ -122,18 +123,21 @@ async def index_client_item(
         text_chunks = chunk_text(item.extracted_text)
         chunks_to_process = [{"index": c["chunk_index"], "text": c["content"]} for c in text_chunks]
 
-    for c in chunks_to_process:
-        vector = generate_embedding(c["text"])
-        chunk_obj = DocumentChunk(
-            file_id=db_file.id,
-            user_id=current_user.id,
-            device_id=device.id,
-            chunk_index=c["index"],
-            content=c["text"],
-            token_count=len(c["text"].split()),
-            embedding_json=json.dumps(vector),
-        )
-        db.add(chunk_obj)
+    chunk_texts = [c["text"] for c in chunks_to_process]
+    if chunk_texts:
+        # Offload batch embedding generation so it executes in a background thread
+        vectors = await asyncio.to_thread(generate_embeddings_batch, chunk_texts)
+        for c, vec in zip(chunks_to_process, vectors):
+            chunk_obj = DocumentChunk(
+                file_id=db_file.id,
+                user_id=current_user.id,
+                device_id=device.id,
+                chunk_index=c["index"],
+                content=c["text"],
+                token_count=len(c["text"].split()),
+                embedding_json=json.dumps(vec),
+            )
+            db.add(chunk_obj)
 
     await db.commit()
     await db.refresh(db_file)
@@ -174,11 +178,26 @@ async def upload_and_index_file(
         await db.flush()
 
     data = await file.read()
-    extracted = extract_content_from_file(file.filename, data)
+    content_hash = compute_sha256(data)
+
+    # Fast hash check: Skip repeat indexing if unchanged
+    existing = await db.execute(
+        select(IndexedFile).where(
+            IndexedFile.user_id == current_user.id,
+            IndexedFile.device_id == device.id,
+            IndexedFile.content_hash == content_hash,
+        )
+    )
+    db_existing = existing.scalar_one_or_none()
+    if db_existing:
+        return {"message": f"File '{file.filename}' unchanged. Index up to date.", "file_id": db_existing.id, "chunks_indexed": 0}
+
+    # Offload CPU extraction to thread pool
+    extracted = await asyncio.to_thread(extract_content_from_file, file.filename, data)
 
     full_text = extracted.get("text", "")
     if extracted.get("is_image"):
-        ocr_res = extract_ocr_from_image(data)
+        ocr_res = await asyncio.to_thread(extract_ocr_from_image, data)
         if ocr_res.get("text"):
             full_text = f"{full_text}\n{ocr_res['text']}".strip()
 
@@ -188,7 +207,7 @@ async def upload_and_index_file(
         relative_path=file.filename,
         extension=extracted.get("extension", ""),
         size_bytes=len(data),
-        content_hash=extracted["content_hash"],
+        content_hash=content_hash,
         extracted_text=full_text,
         sync_status="full_synced",
     )
